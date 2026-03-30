@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install tnr by reading latest.json from Google Cloud Storage, verifying checksums, and
-# installing to ~/.tnr/bin.
+# Install tnr from Thunder-Compute/thunder-cli GitHub releases.
 
-CHANNEL=${TNR_UPDATE_CHANNEL:-stable}
 VERSION=${TNR_VERSION:-}
-LATEST_URL=${TNR_LATEST_URL:-}
 INSTALL_DIR="${HOME}/.tnr/bin"
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -128,61 +125,45 @@ ensure_jq() {
 
 ensure_jq
 
-if [[ -z "$LATEST_URL" ]]; then
-  if [[ -n "${TNR_DOWNLOAD_BASE:-}" ]]; then
-    LATEST_URL="${TNR_DOWNLOAD_BASE}/tnr/releases/latest.json"
-  else
-    # Default to Google Cloud Storage
-    LATEST_URL="https://storage.googleapis.com/thunder-cli/tnr/releases/latest.json"
-  fi
-fi
+GITHUB_REPO="Thunder-Compute/thunder-cli"
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-echo "Fetching manifest: $LATEST_URL"
-curl -fsSL "$LATEST_URL" -o "$tmpdir/latest.json"
+echo "Fetching latest release from GitHub"
+release_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+curl -fsSL "$release_url" -o "$tmpdir/release.json"
 
 if [[ -z "$VERSION" ]]; then
-  VERSION=$(jq -r '.version' "$tmpdir/latest.json")
+  VERSION=$(jq -r '.tag_name' "$tmpdir/release.json" | sed 's/^v//')
 fi
 
-asset_key="${OS}/${ARCH}"
-url=$(jq -r --arg k "$asset_key" '.assets[$k]' "$tmpdir/latest.json")
+asset_name="tnr_${VERSION}_${OS}_${ARCH}.tar.gz"
+asset_url=$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$tmpdir/release.json")
 
-# Detect archive extension from URL - Linux uses .tar.gz, Windows uses .zip
-if [[ "$url" == *.tar.gz ]]; then
-  archive="$tmpdir/tnr.tar.gz"
-elif [[ "$url" == *.zip ]]; then
-  archive="$tmpdir/tnr.zip"
-  # Check for unzip if we need it
-  if ! command -v unzip >/dev/null 2>&1; then
-    echo "Error: unzip is required for .zip archives but not installed." >&2
-    exit 1
-  fi
-else
-  echo "Unknown archive format in URL: $url" >&2
+if [[ -z "$asset_url" ]]; then
+  echo "Error: Could not find asset $asset_name in the latest release" >&2
   exit 1
 fi
 
-checksums=$(jq -r '.assets["checksums"]' "$tmpdir/latest.json")
+echo "Downloading $asset_url"
+archive="$tmpdir/tnr.tar.gz"
+curl -fL "$asset_url" -o "$archive"
 
-echo "Downloading $url"
-curl -fL "$url" -o "$archive"
-curl -fsSL "$checksums" -o "$tmpdir/checksums.txt"
-
-echo "Verifying checksum"
-sum=$(sha256sum "$archive" | awk '{print $1}')
-grep -q "$sum" "$tmpdir/checksums.txt" || { echo "Checksum mismatch" >&2; exit 1; }
+checksums_url=$(jq -r --arg name "checksums.txt" '.assets[] | select(.name == $name) | .browser_download_url' "$tmpdir/release.json")
+if [[ -n "$checksums_url" ]]; then
+  echo "Verifying checksum"
+  curl -fsSL "$checksums_url" -o "$tmpdir/checksums.txt"
+  sum=$(sha256sum "$archive" | awk '{print $1}')
+  grep -q "$sum" "$tmpdir/checksums.txt" || { echo "Checksum mismatch" >&2; exit 1; }
+else
+  echo "Warning: checksums.txt not found in release, skipping checksum verification"
+fi
 
 mkdir -p "$INSTALL_DIR"
 
 echo "Extracting"
-if [[ "$archive" == *.tar.gz ]]; then
-  tar -xzf "$archive" -C "$tmpdir"
-else
-  unzip -q "$archive" -d "$tmpdir"
-fi
+tar -xzf "$archive" -C "$tmpdir"
 
 install -m 0755 "$tmpdir/tnr" "$INSTALL_DIR/tnr"
 
